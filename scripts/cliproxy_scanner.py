@@ -9,7 +9,7 @@ import ssl
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 DEFAULT_BASE_URL = os.environ.get("CLIPROXY_BASE_URL", "")
 DEFAULT_MGMT_KEY = os.environ.get("CLIPROXY_MANAGEMENT_KEY", "")
@@ -17,6 +17,7 @@ DEFAULT_AUTH_FILES_ENDPOINT = os.environ.get("CLIPROXY_AUTH_FILES_ENDPOINT", "/v
 DEFAULT_API_CALL_ENDPOINT = os.environ.get("CLIPROXY_API_CALL_ENDPOINT", "/v0/management/api-call")
 DEFAULT_AUTH_DELETE_ENDPOINT = os.environ.get("CLIPROXY_AUTH_DELETE_ENDPOINT", "/v0/management/auth-files")
 DEFAULT_PROBE_URL = os.environ.get("CODEX_PROBE_URL", "https://chatgpt.com/backend-api/codex/responses")
+DEFAULT_ALLOWED_PROBE_HOSTS = os.environ.get("CLIPROXY_ALLOWED_PROBE_HOSTS", "chatgpt.com")
 DEFAULT_WORKERS = int(os.environ.get("SCAN_WORKERS", "80"))
 
 
@@ -170,6 +171,27 @@ def _delete_auth_file(base_url: str, key: str, endpoint: str, name: str, insecur
     return code < 400
 
 
+def _normalize_hosts_csv(raw: str) -> set[str]:
+    return {h.strip().lower() for h in (raw or "").split(",") if h.strip()}
+
+
+def _assert_probe_url_safe(probe_url: str, allowed_hosts_csv: str, unsafe_allow: bool) -> None:
+    parsed = urlparse(probe_url)
+    if parsed.scheme != "https":
+        raise SystemExit("Security check failed: --probe-url must use https")
+    host = (parsed.hostname or "").lower()
+    allowed = _normalize_hosts_csv(allowed_hosts_csv)
+    if not host:
+        raise SystemExit("Security check failed: --probe-url host is empty")
+    if host not in allowed:
+        if unsafe_allow:
+            return
+        raise SystemExit(
+            f"Security check failed: probe host '{host}' not in allowlist {sorted(allowed)}. "
+            "Use --allow-unsafe-probe-host only if you fully trust this host."
+        )
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Scan Codex auth via CLI Proxy management api-call (supports runtime refresh/quota view)")
     p.add_argument("--base-url", default=DEFAULT_BASE_URL)
@@ -178,10 +200,13 @@ def main() -> int:
     p.add_argument("--api-call-endpoint", default=DEFAULT_API_CALL_ENDPOINT)
     p.add_argument("--auth-delete-endpoint", default=DEFAULT_AUTH_DELETE_ENDPOINT)
     p.add_argument("--probe-url", default=DEFAULT_PROBE_URL)
+    p.add_argument("--allowed-probe-hosts", default=DEFAULT_ALLOWED_PROBE_HOSTS, help="Comma-separated allowlist for probe host, default: chatgpt.com")
+    p.add_argument("--allow-unsafe-probe-host", action="store_true", help="Allow probe host outside allowlist (DANGEROUS)")
     p.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     p.add_argument("--delete-401", action="store_true")
     p.add_argument("--yes", action="store_true")
-    p.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification")
+    p.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification (DANGEROUS)")
+    p.add_argument("--allow-insecure-tls", action="store_true", help="Second confirmation for --insecure")
     p.add_argument("--output-json", action="store_true")
     args = p.parse_args()
 
@@ -189,6 +214,9 @@ def main() -> int:
         raise SystemExit("Missing required params: --base-url and --management-key")
     if args.workers < 1:
         raise SystemExit("--workers must be >= 1")
+    if args.insecure and not args.allow_insecure_tls:
+        raise SystemExit("Security check failed: --insecure requires explicit --allow-insecure-tls")
+    _assert_probe_url_safe(args.probe_url, args.allowed_probe_hosts, args.allow_unsafe_probe_host)
 
     auths = _list_codex_auths(args.base_url, args.management_key, args.auth_files_endpoint, args.insecure)
 

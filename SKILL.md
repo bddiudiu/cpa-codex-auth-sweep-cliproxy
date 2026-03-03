@@ -1,6 +1,6 @@
 ---
 name: cpa-codex-auth-sweep-cliproxy
-description: 通过 CLI Proxy API 拉取 Codex 授权数据并进行高并发探活扫描的技能。适用于「扫号」「清死号」「清理 Codex 401」「扫描凭证」等场景；支持仅扫描和明确授权后的 401 清理。
+description: 通过 CLI Proxy Management API 拉取 Codex 认证文件并高并发探活扫描。适用于「扫号」「清死号」「清理 Codex 401」场景；仅在用户明确确认后可删除 401。执行前必须提供 base_url 与 management_key。安全限制：默认仅允许 https://chatgpt.com 作为 probe 主机，非白名单目标需显式危险确认。
 ---
 
 # 技能说明
@@ -19,6 +19,17 @@ description: 通过 CLI Proxy API 拉取 Codex 授权数据并进行高并发探
 - `management_key`（管理密钥）
 
 如果用户未提供这两个参数，禁止开始扫描；应先提示用户补全。
+
+## 安全提示（必须阅读）
+
+本技能通过管理 API 的 `api-call` 发起探测，请求头中使用 `Authorization: Bearer $TOKEN$`。这意味着 **管理端会把真实 token 转发到 `probe-url` 指向的主机**。
+
+因此必须遵守：
+
+1. 默认仅允许 `https://chatgpt.com/...` 作为探测目标。
+2. 扫描前必须向用户确认 `probe-url`（若用户改过）。
+3. 若要使用非白名单主机，必须得到用户明确授权，并显式传 `--allow-unsafe-probe-host`。
+4. 禁止默认使用 `--insecure`；仅在内网排障且用户明确授权时，才可同时传 `--insecure --allow-insecure-tls`。
 
 ## 执行入口
 
@@ -45,10 +56,12 @@ python3 <SKILL目录>/scripts/cliproxy_scanner.py \
   --output-json --delete-401 --yes
 ```
 
-## 必要环境变量
+## 必要环境变量（Required）
 
 - `CLIPROXY_BASE_URL`：CLI Proxy API 管理端地址（例：`http://localhost:8317`）
-- `CLIPROXY_MANAGEMENT_KEY`：管理密钥（Management Key）
+- `CLIPROXY_MANAGEMENT_KEY`：管理密钥（Management Key，主凭据 / primary credential）
+
+> 两者缺一不可。
 
 可选：
 
@@ -56,7 +69,8 @@ python3 <SKILL目录>/scripts/cliproxy_scanner.py \
 - `CLIPROXY_API_CALL_ENDPOINT`：管理 API Call 接口（默认：`/v0/management/api-call`）
 - `CLIPROXY_AUTH_DELETE_ENDPOINT`：认证文件删除接口（默认：`/v0/management/auth-files`，通过 `?name=` 删除）
 - `CODEX_PROBE_URL`：Codex 探活 URL（默认：`https://chatgpt.com/backend-api/codex/responses`）
-- `SCAN_WORKERS`：并发数（默认：200）
+- `CLIPROXY_ALLOWED_PROBE_HOSTS`：允许的 probe host 白名单（默认：`chatgpt.com`）
+- `SCAN_WORKERS`：并发数（默认：80）
 
 ## 判定口径（已对齐）
 
