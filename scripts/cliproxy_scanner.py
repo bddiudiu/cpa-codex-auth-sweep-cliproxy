@@ -6,6 +6,7 @@ import concurrent.futures
 import json
 import os
 import ssl
+import sys
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
@@ -19,6 +20,20 @@ DEFAULT_AUTH_DELETE_ENDPOINT = os.environ.get("CLIPROXY_AUTH_DELETE_ENDPOINT", "
 DEFAULT_PROBE_URL = os.environ.get("CODEX_PROBE_URL", "https://chatgpt.com/backend-api/codex/responses")
 DEFAULT_ALLOWED_PROBE_HOSTS = os.environ.get("CLIPROXY_ALLOWED_PROBE_HOSTS", "chatgpt.com")
 DEFAULT_WORKERS = int(os.environ.get("SCAN_WORKERS", "80"))
+DEFAULT_PROBE_WORKERS = int(os.environ.get("PROBE_WORKERS", str(DEFAULT_WORKERS)))
+DEFAULT_DELETE_WORKERS = int(os.environ.get("DELETE_WORKERS", "16"))
+DEFAULT_MAX_ACTIVE_PROBES = int(os.environ.get("MAX_ACTIVE_PROBES", "120"))
+
+INVALID_TOKEN_KEYWORDS = [
+    '"status": 401',
+    '"status":401',
+    'token_invalidated',
+    'token_revoked',
+    'invalid auth',
+    'unauthorized',
+    'Your authentication token has been invalidated.',
+    'Encountered invalidated oauth token for user',
+]
 
 
 @dataclass
@@ -39,6 +54,7 @@ class CheckResult:
     weekly_quota_zero: bool
     error: str
     response_preview: str
+    reason: str = ""
 
 
 def _json_request(url: str, method: str, headers: dict[str, str], body_obj: dict | None, timeout: int, insecure: bool) -> tuple[int, dict | str]:
@@ -79,6 +95,15 @@ def _probe_payload() -> dict:
         "input": [{"role": "user", "content": [{"type": "input_text", "text": "ping"}]}],
         "max_output_tokens": 1,
     }
+
+
+def _match_static_reason(auth: AuthEntry) -> str:
+    s = (auth.status_message or "")
+    sl = s.lower()
+    for kw in INVALID_TOKEN_KEYWORDS:
+        if kw.lower() in sl:
+            return f"status_message:{kw}"
+    return ""
 
 
 def _list_codex_auths(base_url: str, key: str, endpoint: str, insecure: bool) -> list[AuthEntry]:
@@ -141,13 +166,13 @@ def _probe_via_management_api_call(base_url: str, key: str, api_call_endpoint: s
             insecure=insecure,
         )
     except Exception as e:  # noqa: BLE001
-        return CheckResult(auth.name, auth.auth_index, None, False, False, f"api_call error: {e}", "")
+        return CheckResult(auth.name, auth.auth_index, None, False, False, f"api_call error: {e}", "", "probe_error")
 
     if code >= 400:
-        return CheckResult(auth.name, auth.auth_index, None, False, False, f"management api_call failed: {code}", str(resp)[:220])
+        return CheckResult(auth.name, auth.auth_index, None, False, False, f"management api_call failed: {code}", str(resp)[:220], "management_api_call_failed")
 
     if not isinstance(resp, dict):
-        return CheckResult(auth.name, auth.auth_index, None, False, False, "invalid api_call response", str(resp)[:220])
+        return CheckResult(auth.name, auth.auth_index, None, False, False, "invalid api_call response", str(resp)[:220], "invalid_api_call_response")
 
     status_code = resp.get("status_code")
     body_text = resp.get("body") if isinstance(resp.get("body"), str) else json.dumps(resp.get("body"), ensure_ascii=False)
@@ -155,7 +180,14 @@ def _probe_via_management_api_call(base_url: str, key: str, api_call_endpoint: s
 
     unauthorized = (status_code == 401) or ("invalid auth" in low) or ("revoked" in low)
     weekly_zero = _is_weekly_quota_zero(status_code, body_text or "")
-    return CheckResult(auth.name, auth.auth_index, status_code, unauthorized, weekly_zero, "", (body_text or "")[:220])
+    reason = ""
+    if status_code == 401:
+        reason = "probe_status_401"
+    elif "invalid auth" in low or "revoked" in low:
+        reason = "probe_invalid_or_revoked"
+    elif weekly_zero:
+        reason = "probe_weekly_quota_zero"
+    return CheckResult(auth.name, auth.auth_index, status_code, unauthorized, weekly_zero, "", (body_text or "")[:220], reason)
 
 
 def _delete_auth_file(base_url: str, key: str, endpoint: str, name: str, insecure: bool) -> bool:
@@ -192,6 +224,12 @@ def _assert_probe_url_safe(probe_url: str, allowed_hosts_csv: str, unsafe_allow:
         )
 
 
+def _progress(msg: str, enabled: bool) -> None:
+    if not enabled:
+        return
+    print(msg, file=sys.stderr, flush=True)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Scan Codex auth via CLI Proxy management api-call (supports runtime refresh/quota view)")
     p.add_argument("--base-url", default=DEFAULT_BASE_URL)
@@ -203,35 +241,76 @@ def main() -> int:
     p.add_argument("--allowed-probe-hosts", default=DEFAULT_ALLOWED_PROBE_HOSTS, help="Comma-separated allowlist for probe host, default: chatgpt.com")
     p.add_argument("--allow-unsafe-probe-host", action="store_true", help="Allow probe host outside allowlist (DANGEROUS)")
     p.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    p.add_argument("--probe-workers", type=int, default=DEFAULT_PROBE_WORKERS)
+    p.add_argument("--delete-workers", type=int, default=DEFAULT_DELETE_WORKERS)
+    p.add_argument("--max-active-probes", type=int, default=DEFAULT_MAX_ACTIVE_PROBES)
     p.add_argument("--delete-401", action="store_true")
     p.add_argument("--yes", action="store_true")
     p.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification (DANGEROUS)")
     p.add_argument("--allow-insecure-tls", action="store_true", help="Second confirmation for --insecure")
+    p.add_argument("--progress", action="store_true", help="Print live progress logs")
+    p.add_argument("--progress-every", type=int, default=10, help="Progress report interval, default: 10")
     p.add_argument("--output-json", action="store_true")
     args = p.parse_args()
 
     if not args.base_url or not args.management_key:
         raise SystemExit("Missing required params: --base-url and --management-key")
-    if args.workers < 1:
-        raise SystemExit("--workers must be >= 1")
+    if args.workers < 1 or args.probe_workers < 1 or args.delete_workers < 1:
+        raise SystemExit("--workers/--probe-workers/--delete-workers must be >= 1")
+    if args.max_active_probes < 0:
+        raise SystemExit("--max-active-probes must be >= 0")
+    if args.progress_every < 1:
+        raise SystemExit("--progress-every must be >= 1")
     if args.insecure and not args.allow_insecure_tls:
         raise SystemExit("Security check failed: --insecure requires explicit --allow-insecure-tls")
     _assert_probe_url_safe(args.probe_url, args.allowed_probe_hosts, args.allow_unsafe_probe_host)
 
+    _progress("[skill] 开始执行扫描任务", args.progress)
     auths = _list_codex_auths(args.base_url, args.management_key, args.auth_files_endpoint, args.insecure)
+    total = len(auths)
+    _progress(f"[skill] 已获取 auth files：{total} 条", args.progress)
 
     results: list[CheckResult] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = [ex.submit(_probe_via_management_api_call, args.base_url, args.management_key, args.api_call_endpoint, args.probe_url, a, args.insecure) for a in auths]
+
+    # Stage 1: static quick match from status_message
+    static_invalid: list[CheckResult] = []
+    active_candidates: list[AuthEntry] = []
+    for a in auths:
+        reason = _match_static_reason(a)
+        if reason:
+            static_invalid.append(CheckResult(a.name, a.auth_index, None, True, False, "", a.status_message[:220], reason))
+        else:
+            active_candidates.append(a)
+
+    # Stage 2: active probe with cap
+    if args.max_active_probes > 0 and len(active_candidates) > args.max_active_probes:
+        _progress(f"[skill] 主动探测候选 {len(active_candidates)} 条，仅探测前 {args.max_active_probes} 条", args.progress)
+        active_candidates = active_candidates[: args.max_active_probes]
+
+    _progress(f"[skill] 开始校验：静态命中 {len(static_invalid)}，主动探测 {len(active_candidates)}", args.progress)
+    results.extend(static_invalid)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.probe_workers) as ex:
+        futs = [ex.submit(_probe_via_management_api_call, args.base_url, args.management_key, args.api_call_endpoint, args.probe_url, a, args.insecure) for a in active_candidates]
+        done = 0
+        step = args.progress_every
+        total_probe = len(active_candidates)
         for f in concurrent.futures.as_completed(futs):
             results.append(f.result())
+            done += 1
+            if done == 1 or done % step == 0 or done == total_probe:
+                _progress(f"[skill] 正在处理第 {done} 条 / 共 {total_probe} 条", args.progress)
+
+    _progress("[skill] 全部校验完成", args.progress)
 
     to_delete = [r.name for r in results if r.unauthorized_401]
     deleted = 0
     if args.delete_401 and args.yes and to_delete:
-        for name in to_delete:
-            if _delete_auth_file(args.base_url, args.management_key, args.auth_delete_endpoint, name, args.insecure):
-                deleted += 1
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.delete_workers) as ex:
+            futs = [ex.submit(_delete_auth_file, args.base_url, args.management_key, args.auth_delete_endpoint, name, args.insecure) for name in to_delete]
+            for f in concurrent.futures.as_completed(futs):
+                if f.result():
+                    deleted += 1
 
     management_quota_exhausted = sum(
         1
@@ -244,6 +323,13 @@ def main() -> int:
         k = str(r.status_code) if r.status_code is not None else "none"
         status_buckets[k] = status_buckets.get(k, 0) + 1
 
+    reason_buckets: dict[str, int] = {}
+    for r in results:
+        k = r.reason or ""
+        if not k:
+            continue
+        reason_buckets[k] = reason_buckets.get(k, 0) + 1
+
     payload = {
         "summary": {
             "total": len(results),
@@ -253,6 +339,9 @@ def main() -> int:
             "errors": sum(1 for r in results if r.error),
             "management_quota_exhausted": management_quota_exhausted,
             "status_code_buckets": status_buckets,
+            "reason_buckets": reason_buckets,
+            "static_matched": len(static_invalid),
+            "active_probed": len(active_candidates),
         },
         "deletion": {
             "requested": bool(args.delete_401),
@@ -269,6 +358,7 @@ def main() -> int:
         s = payload["summary"]
         print(f"total={s['total']} invalid={s['unauthorized_401']} weekly_zero={s['weekly_quota_zero']} ok={s['ok']} errors={s['errors']} mgmt_quota_exhausted={s['management_quota_exhausted']}")
         print(f"status_code_buckets={json.dumps(s['status_code_buckets'], ensure_ascii=False)}")
+        print(f"reason_buckets={json.dumps(s['reason_buckets'], ensure_ascii=False)}")
 
     return 1 if payload["summary"]["unauthorized_401"] > 0 else 0
 

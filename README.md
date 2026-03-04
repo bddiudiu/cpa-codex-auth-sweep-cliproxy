@@ -48,6 +48,7 @@ python3 scripts/cliproxy_scanner.py \
   --base-url "https://your-cliproxy.example.com" \
   --management-key "YOUR_MANAGEMENT_KEY" \
   --workers 120 \
+  --progress \
   --output-json
 ```
 
@@ -58,6 +59,7 @@ python3 scripts/cliproxy_scanner.py \
   --base-url "https://your-cliproxy.example.com" \
   --management-key "YOUR_MANAGEMENT_KEY" \
   --workers 120 \
+  --progress \
   --delete-401 --yes \
   --output-json
 ```
@@ -77,6 +79,7 @@ python3 scripts/cliproxy_scanner.py ... --insecure
 - `--insecure`：关闭 TLS 校验（仅内网调试建议）
 - `--allowed-probe-hosts`：probe host 白名单（默认 `chatgpt.com`）
 - `--allow-unsafe-probe-host`：允许使用非白名单 probe host（危险）
+- `--progress-every`：进度输出间隔（默认每 10 条）
 
 ## 输出说明
 
@@ -90,7 +93,7 @@ python3 scripts/cliproxy_scanner.py ... --insecure
 - `management_quota_exhausted`：管理端状态视角 quota exhausted 数量
 - `status_code_buckets`：状态码分布
 
-## 安全声明
+## 安全声明模板（可直接贴论坛 / GitHub）
 
 > 本技能使用 CLI Proxy Management API 的 `api-call` 机制对授权做探测。该机制会将真实 token 按 `probe-url` 转发到目标主机。为降低风险：
 > 1) 默认仅允许 `https://chatgpt.com`；

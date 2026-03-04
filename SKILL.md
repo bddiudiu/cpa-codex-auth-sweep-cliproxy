@@ -84,3 +84,7 @@ python3 <SKILL目录>/scripts/cliproxy_scanner.py \
 - 用户只说“看看/扫一下”时：只扫描，不删除。
 - 只有在用户明确表达“删掉/清理/扬了”等意图时，才允许 `--delete-401`。
 - 汇报优先给出汇总统计（total / ok / 401 / exceeded / error）。
+- 执行时必须开启 `--progress` 并持续反馈进度：
+  1) 开始执行
+  2) 已获取 auth file 总数
+  3) 校验过程中按 `--progress-every`（默认 10）输出“第 N 条 / 共 M 条”直到完成
