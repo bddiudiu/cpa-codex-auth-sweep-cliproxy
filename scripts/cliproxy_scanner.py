@@ -88,12 +88,18 @@ def _is_weekly_quota_zero(status_code: int | None, text: str) -> bool:
 
 
 def _probe_payload() -> dict:
+    # NOTE for current CPA backend compatibility:
+    # - stream must be true
+    # - instructions required
+    # - input must be a list
+    # - store must be false
+    # - max_output_tokens is not supported
     return {
         "model": "gpt-5",
         "instructions": "ping",
         "store": False,
+        "stream": True,
         "input": [{"role": "user", "content": [{"type": "input_text", "text": "ping"}]}],
-        "max_output_tokens": 1,
     }
 
 
